@@ -1,0 +1,295 @@
+name: Deploy GQL Federated application to GKE in Staging of AP Region
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches: [ 'staging' ]
+
+
+env:
+  BRANCH: ${{ github.event.pull_request.base.ref }}
+ 
+jobs:
+  lint:
+    if: ${{ startsWith(github.event.pull_request.title, '[ap/eu/us/') && github.event.pull_request.merged == true }}
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installing dependent npm packages
+        uses: ./.github/actions/installing_packages
+
+      - name: Linting
+        run: npm run lint
+        shell: bash
+
+
+  tests_coverage:
+    needs: lint
+    name: Test Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout code
+        uses: ./.github/actions/jest-test
+        with:
+          npm-script: test:coverage    
+
+  apollo-check:
+    if: ${{ startsWith(github.event.pull_request.title, '[ap/eu/us/') && github.event.pull_request.merged == true }}
+    name: apollo check
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        environment: [staging, preprod, production]
+        region: [ap, eu, us]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apollo check nonprod variants
+        if: ${{ matrix.environment == 'staging' }}
+        uses: ./.github/actions/apollo-check
+        with:
+          graph_ref: puma-federation-nonprod@${{ matrix.environment }}-${{ matrix.region }}
+          apolloKey: ${{ secrets.APOLLO_KEY_NONPROD }}
+
+      - name: Apollo check prod variants
+        if: ${{ matrix.environment == 'preprod' || matrix.environment == 'production' }}
+        uses: ./.github/actions/apollo-check
+        with:
+          graph_ref: puma-federation-prod@${{ matrix.environment }}-${{ matrix.region }}
+          apolloKey: ${{ secrets.APOLLO_KEY_PROD }}
+
+  Build:
+    needs: tests_coverage
+    name: Build SubGraph Application
+    runs-on: ubuntu-latest
+ 
+    permissions:
+      contents: read
+      id-token: write
+ 
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Run Action for Retrieving PR Title
+      uses: ./.github/actions/get-pr-title
+    
+    - name: Run Action for Getting AP Staging Environmental Variables
+      uses: ./.github/actions/get-inputs-staging/ap-staging
+    
+    ### Printing Variables for Testing ###
+    - run: |
+        echo ${{ env.APOLLO_URL }}
+        echo ${{ env.GKE_PROJECT }}
+        echo ${{ env.SUBGRAPH_NAME }}
+        echo ${{ env.NAMESPACE }}
+        echo ${{ env.FAST_SERVICE_ACCOUNT }}
+        echo ${{ env.REGION }}
+
+    - name: Run Action for GCP Authentication
+      uses: ./.github/actions/gcp_authentication
+
+    - name: RUn Action for Installing packages
+      uses: ./.github/actions/installing_packages
+
+    ### Docker Image Creation ###
+    - name: Create docker image
+      run:
+        npx nx container ${{env.SUBGRAPH_NAME}} --verbose
+      env:
+        INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    ### Authenticate to Artifact Registry ###
+    - name: Configure Docker CLI
+      run: |
+        gcloud auth list
+        gcloud auth configure-docker ${{ env.GCP_AR_URL }} -q
+    - name: Docker list
+      run: docker images
+
+    ### Docker Image Tag ###
+    - name: Tag Docker image
+      run: |
+        docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{ env.VERSION_NUMBER }}
+        docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+        docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.PPD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{ env.VERSION_NUMBER }}
+        docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.PPD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+        docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.PRD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{ env.VERSION_NUMBER }}
+        docker tag ${{ env.DEPLOYMENT_NAME }}:latest ${{ env.GCP_AR_URL }}/${{ env.PRD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+
+
+    ### Pubishing Image to AR ###
+    - name: Push Docker image
+      run: |
+          gcloud auth configure-docker ${{ env.GKE_REGION }}-docker.pkg.dev
+          docker push ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{env.VERSION_NUMBER}}
+          docker push ${{ env.GCP_AR_URL }}/${{ env.NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+          docker push ${{ env.GCP_AR_URL }}/${{ env.PPD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{env.VERSION_NUMBER}}
+          docker push ${{ env.GCP_AR_URL }}/${{ env.PPD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+          docker push ${{ env.GCP_AR_URL }}/${{ env.PRD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:${{env.VERSION_NUMBER}}
+          docker push ${{ env.GCP_AR_URL }}/${{ env.PRD_NAMESPACE }}/graphqlfederation-${{ env.DEPLOYMENT_NAME }}:latest
+
+
+  Deploy:
+    name: Deploy SubGraph Application to Cluster
+    runs-on: ubuntu-latest
+    needs: Build
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Action for Retrieving PR title
+        uses: ./.github/actions/get-pr-title
+      
+      - name: Run Action for Getting AP Staging Environmental Variables
+        uses: ./.github/actions/get-inputs-staging/ap-staging
+
+      - name: Run Action for GCP Authentication
+        uses: ./.github/actions/gcp_authentication
+        id: gcp-auth
+
+      - id: 'get-credentials'
+        name: Set up GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_REGION }}
+          project_id: ${{env.GKE_PROJECT}}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4.2.0
+        with:
+          version: 'latest'
+        id: install
+
+      ## Set Up Helm dependency ###
+      - name: Setup Helm dependency
+        run: |
+          cd helm/
+          echo "GITHUB_WORKSPACE = ${{ github.workspace }}"
+          echo "Current directory: $(pwd)"
+          helm dependency build ./${{ env.DEPLOYMENT_NAME }}
+
+      # helm dry run and check for staging prior to helm upgrade
+      - name: Helm dry run staging
+        id: helm_dry_run_staging
+        run: |    
+          cd helm/       
+          input="${{ vars.STAGING_IMAGE_TAGS }}"
+          # Change IFS to comma for splitting the input into services
+          IFS=',' read -r -a imageTagArray <<< "$input"
+          
+          # Loop through each service and split by '='
+          for imageTagList in "${imageTagArray[@]}"; do
+              IFS='=' read -r env imageTag <<< "$imageTagList"
+              if [[ $env == 'ap-stg' ]]; then
+                echo "Service Name: $env, Image Tag: $imageTag"
+                helm install ${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.ENVIRONMENT }} ./${{ env.DEPLOYMENT_NAME }} --namespace=${{ env.NAMESPACE }} --values ./${{ env.DEPLOYMENT_NAME }}/${{ env.REGION }}/values.${{ env.ENVIRONMENT }}.yaml --dry-run --debug \
+                  --set base-subgraph-helm-chart.image.tag=$imageTag
+              fi
+          done  
+
+          # helm install ${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.ENVIRONMENT }} ./${{ env.DEPLOYMENT_NAME }} --namespace=${{ env.NAMESPACE }} --values ./${{ env.DEPLOYMENT_NAME }}/${{ env.REGION }}/values.${{ env.ENVIRONMENT }}.yaml --dry-run --debug
+
+        continue-on-error: false 
+
+      - name: Check dry run result of staging
+        if: ${{ steps.helm_dry_run_staging.outcome != 'success' }}
+        run: echo "Dry run failed for staging. Please check the logs and fix the issues."
+        continue-on-error: false   
+          
+      ## Deploy Manifest files to GKE Cluster using Helm ###
+      - name: Deploy using Helm in ${{ env.NAMESPACE }} namespace
+        if: ${{ steps.helm_dry_run_staging.outcome == 'success' }}      
+        run: |
+          cd helm/
+
+          input="${{ vars.STAGING_IMAGE_TAGS }}"
+
+          # Change IFS to comma for splitting the input into services
+          IFS=',' read -r -a imageTagArray <<< "$input"
+          
+          # Loop through each service and split by '='
+          for imageTagList in "${imageTagArray[@]}"; do
+              IFS='=' read -r env imageTag <<< "$imageTagList"
+              if [[ $env == 'ap-stg' ]]; then
+                echo "Service Name: $env, Image Tag: $imageTag"          
+                echo "Running Helm deployment to ${{ env.ENVIRONMENT }}"
+                helm upgrade --install ${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.ENVIRONMENT }} ./${{ env.DEPLOYMENT_NAME }} \
+                  --wait --atomic \
+                  --namespace=${{ env.NAMESPACE }} \
+                  --set base-subgraph-helm-chart.image.tag=$imageTag \
+                  --values ./${{ env.DEPLOYMENT_NAME }}/${{env.REGION }}/values.${{ env.ENVIRONMENT }}.yaml
+                if [[ $imageTag == 'latest' ]]; then
+                  kubectl rollout restart deployments/${{ env.DEPLOYMENT_NAME }}-${{ env.REGION }}-${{ env.ENVIRONMENT }} -n ${{ env.NAMESPACE }}                 
+                fi
+              fi
+          done
+
+  Apollo-Push:
+    name: Apollo Push
+    runs-on: ubuntu-latest
+    needs: Deploy
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Action for Retrieving PR title
+        uses: ./.github/actions/get-pr-title
+
+      - name: Run Action for Getting AP Staging Environmental Variables
+        uses: ./.github/actions/get-inputs-staging/ap-staging
+
+      - name: Run Action for Apollo Push Variables
+        uses: ./.github/actions/apollo-push-inputs
+        with:
+          apollo_key_nonprod: ${{ secrets.APOLLO_KEY_NONPROD }}
+          apollo_key_prod: ${{ secrets.APOLLO_KEY_PROD }}
+            
+      ### Printing Variables for Testing ###
+      - run: |
+          echo ${{ env.APOLLO_URL }}
+          echo ${{ env.GKE_PROJECT }}
+          echo ${{ env.SUBGRAPH_NAME }}
+          echo ${{ env.NAMESPACE }}
+          echo ${{ env.FAST_SERVICE_ACCOUNT }}
+          echo ${{ env.REGION }}
+
+      - uses: ./.github/actions/apollo_push
+        with:
+          graphRef: ${{ env.GRAPHREF }}
+          apolloKey: ${{ env.APOLLO_KEY_VAR }}
+          url: ${{ env.APOLLO_URL }}
+        
+  e2e_tests:
+    name: E2E Tests
+    needs:
+      - Apollo-Push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: Staging
+      url: https://apollo-router-stg-ap.puma.com/
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/jest-test
+        env:
+          GQL_ENDPOINT: https://apollo-router-stg-ap.puma.com/
+        with:
+          npm-script: recommendationGraph:integration  
+
+  Delete-skipped-work-items:
+    needs: lint
+    uses: ./.github/workflows/graphql-delete-skipped-workflowruns.yaml
+    secrets: inherit
